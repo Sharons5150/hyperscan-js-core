@@ -704,9 +704,10 @@ if (typeof VideoDisplayUnit === 'undefined') {
 // ========== EXPORTAÇÃO GLOBAL ==========
     window.VideoDisplayUnit = VideoDisplayUnit;
 
-    console.log("[VDU] ✓ VideoDisplayUnit carregada");
-    console.log("[VDU] ✓ Extends MemoryRegion - Compatível com MIU");
-    console.log("[VDU] ✓ Suporta acesso de 8/16/32 bits");
-    console.log("[VDU] ✓ Resolução: 320x224 (HyperScan nativa)");
-    console.log("[VDU] ✓ Framebuffer: 0xA0000000 (DRAM)");
+if (this.intC && typeof this.intC.trigger === "function") {
+  const cpu = this.miu?.cpu;
+  if (cpu) {
+    const irq = (this.intC.IRQ_VBLANK !== undefined) ? this.intC.IRQ_VBLANK : 4;
+    this.intC.trigger(cpu, irq);
+  }
 }
