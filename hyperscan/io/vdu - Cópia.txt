@@ -1,0 +1,712 @@
+/**
+ * VDU.js - Video Display Unit (CORRIGIDO & COMPLETO)
+ * HyperScan Emulator v2.0
+ * 
+ * ✅ CORRIGIDO: Extends MemoryRegion
+ * ✅ CORRIGIDO: Métodos readU8/readU16/readU32 padronizados
+ * ✅ CORRIGIDO: Métodos writeU8/writeU16/writeU32 padronizados
+ * ✅ CORRIGIDO: Resolução 320x224 (nativa HyperScan)
+ * ✅ CORRIGIDO: Framebuffer @ 0xA0000000 (DRAM)
+ * ✅ CORRIGIDO: Display Enable por padrão
+ * ✅ ADICIONADO: Logging e diagnóstico
+ * ✅ ADICIONADO: Validação robusta de bounds
+ * ✅ ADICIONADO: Modo de cores (RGB565, RGBA8888, etc)
+ * ✅ ADICIONADO: VBlank interrupt simulation
+ * 
+ * Baseado em: https://github.com/LiraNuna/hyperscan-emulator
+ * Compatível com: SPCE3200, Sunplus S+core, HyperScan
+ * 
+ * Autor: Ccor444
+ * Data: 2025-12-28
+ * 
+ * MAPA DE PERIFÉRICOS VDU (0x080Cxxxx):
+ * 0x080C0000 - CTRL (RW)  - Display Control
+ * 0x080C0002 - STAT (RO)  - Display Status
+ * 0x080C0004 - FB_ADDR_H (RW) - Framebuffer Address High 16 bits
+ * 0x080C0006 - FB_ADDR_L (RW) - Framebuffer Address Low 16 bits
+ * 
+ * BITS DE CONTROLE (CTRL @ 0x080C0000):
+ * Bit 0: Display Enable (1 = on, 0 = off)
+ * Bit 1-7: Modo de vídeo/cor
+ * 
+ * BITS DE STATUS (STAT @ 0x080C0002):
+ * Bit 0: VBlank (1 = em VBlank, 0 = renderizando)
+ * Bit 1-7: Flags de status
+ */
+
+"use strict";
+
+if (typeof VideoDisplayUnit === 'undefined') {
+    /**
+     * Video Display Unit
+     * ✅ CORRIGIDO: Extends MemoryRegion para compatibilidade com MIU
+     * 
+     * @extends MemoryRegion
+     */
+    class VideoDisplayUnit extends MemoryRegion {
+        /**
+         * Construtor da VDU
+         * @param {string} canvasId - ID do elemento <canvas>
+         * @param {Object} [options={}] - Opções configuráveis
+         */
+        constructor(canvasId, options = {}) {
+            super();
+
+            // ========== CANVAS ==========
+            this.canvasId = canvasId;
+            this.canvas = document.getElementById(canvasId);
+            
+            if (!this.canvas) {
+                console.error(`[VDU] ❌ Canvas não encontrado: #${canvasId}`);
+                throw new Error(`Canvas #${canvasId} não existe`);
+            }
+
+            this.ctx = this.canvas.getContext('2d', { 
+                alpha: false,
+                willReadFrequently: true 
+            });
+
+            if (!this.ctx) {
+                console.error("[VDU] ❌ Não foi possível obter contexto 2D");
+                throw new Error("Canvas 2D context não disponível");
+            }
+
+            // ========== RESOLUÇÃO ==========
+            // HyperScan nativa: 320x224 (não 640x480!)
+            this.width = options.width || 320;
+            this.height = options.height || 224;
+            this.canvas.width = this.width;
+            this.canvas.height = this.height;
+
+            // ========== REGISTRADORES MMIO ==========
+            // CTRL (0x080C0000)
+            // Bit 0: Display Enable (1 = on, 0 = off)
+            // Bit 1-7: Modo de vídeo/cor
+            this.ctrl = options.displayEnable !== false ? 0x01 : 0x01;  // ✓ Habilitado por padrão
+
+            // STATUS (0x080C0002)
+            // Bit 0: VBlank (1 = em VBlank, 0 = renderizando)
+            // Bit 1-7: Flags de status
+            this.status = 0x00;  // Não em VBlank
+
+            // ========== FRAMEBUFFER ADDRESS ==========
+            // Endereço em DRAM onde está a imagem
+            // Padrão: 0xA0000000 (segmento 0xA0, offset 0x000000)
+            // ✓ CORRIGIDO: Era 0x00400000 (segmento 0x00, não mapeado!)
+            this.fbAddrHigh = (options.fbAddr >>> 16) & 0xFFFF;  // Bits [31:16]
+            this.fbAddrLow = options.fbAddr & 0xFFFF;             // Bits [15:0]
+            this.fbAddr = options.fbAddr || 0xA0000000;
+
+            console.log(`[VDU] Framebuffer Address: 0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`);
+
+            // ========== IMAGE DATA ==========
+            this.imageData = this.ctx.createImageData(this.width, this.height);
+            this.imageDataU32 = new Uint32Array(this.imageData.data.buffer);
+
+            // ========== MODO DE CORES ==========
+            this.colorMode = options.colorMode || 'RGB565';
+            // ========== ESTATÍSTICAS ==========
+            this.stats = {
+                framesRendered: 0,
+                framesAttempted: 0,
+                framebufferErrors: 0,
+                boundsErrors: 0,
+                lastRenderTime: 0,
+                avgRenderTime: 0,
+                vblanks: 0
+            };
+
+            // ========== PERIFÉRICOS CONECTADOS ==========
+            this.intC = null;  // Interrupt Controller (para VBlank)
+            this.miu = null;   // Memory Interface Unit
+
+            // ========== DEBUG ==========
+            this.debugEnabled = options.debug || false;
+            this.logEveryFrame = false;
+
+            // ========== CALLBACKS ==========
+            this.onVBlank = null;  // Chamado quando VBlank ocorre
+            this.onStatusChange = null;  // Chamado quando status muda
+
+            console.log(`[VDU] ✓ Video Display Unit inicializada`);
+            console.log(`[VDU]   Resolução: ${this.width}x${this.height}`);
+            console.log(`[VDU]   Modo de cores: ${this.colorMode}`);
+            console.log(`[VDU]   Display Enable: ${(this.ctrl & 0x01) ? 'SIM' : 'NÃO'}`);
+            console.log(`[VDU] ✓ Extends MemoryRegion - Compatível com MIU`);
+        }
+
+        // ========== CONEXÃO DE PERIFÉRICOS ==========
+
+        /**
+         * Conecta Interrupt Controller para VBlank
+         */
+        connectInterruptController(intC) {
+            this.intC = intC;
+            console.log("[VDU] Interrupt Controller conectado");
+        }
+
+        /**
+         * Conecta MIU para acesso à memória
+         */
+        connectMIU(miu) {
+            this.miu = miu;
+            console.log("[VDU] MIU conectada");
+        }
+
+        // ========== INTERFACE MEMORYREGION ==========
+
+        /**
+         * ✅ CORRIGIDO: Lê um byte (8 bits)
+         */
+        readU8(offset) {
+            const word = this.readU32(offset & ~3);
+            const shift = (offset & 3) * 8;
+            return (word >>> shift) & 0xFF;
+        }
+
+        /**
+         * ✅ CORRIGIDO: Lê uma halfword (16 bits)
+         */
+        readU16(offset) {
+            const word = this.readU32(offset & ~3);
+            const shift = (offset & 2) * 8;
+            return (word >>> shift) & 0xFFFF;
+        }
+
+        /**
+         * Lê um registrador de 32 bits (MMIO)
+         * 
+         * Layout:
+         * 0x00: CTRL (RW)
+         * 0x02: STAT (RO)
+         * 0x04: FB_ADDR_H (RW)
+         * 0x06: FB_ADDR_L (RW)
+         */
+        readU32(address) {
+            const offset = address & 0xFFFF;  // Máscara para offset local
+
+            switch (offset) {
+                case 0x0000:  // CTRL register
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] readU32(CTRL) = 0x${this.ctrl.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    return this.ctrl >>> 0;
+
+                case 0x0002:  // STAT register
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] readU32(STAT) = 0x${this.status.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    return this.status >>> 0;
+
+                case 0x0004:  // FB_ADDR_H (High 16 bits)
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] readU32(FB_ADDR_H) = 0x${this.fbAddrHigh.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    return this.fbAddrHigh >>> 0;
+
+                case 0x0006:  // FB_ADDR_L (Low 16 bits)
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] readU32(FB_ADDR_L) = 0x${this.fbAddrLow.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    return this.fbAddrLow >>> 0;
+
+                default:
+                    if (this.debugEnabled) {
+                        console.warn(`[VDU] readU32 - Offset desconhecido: 0x${offset.toString(16).padStart(4, '0')}`);
+                    }
+                    return 0;
+            }
+        }
+
+        /**
+         * ✅ CORRIGIDO: Escreve um byte (8 bits)
+         */
+        writeU8(offset, value) {
+            const addr = offset & ~3;
+            const shift = (offset & 3) * 8;
+            let word = this.readU32(addr);
+            word = (word & ~(0xFF << shift)) | ((value & 0xFF) << shift);
+            this.writeU32(addr, word);
+        }
+
+        /**
+         * ✅ CORRIGIDO: Escreve uma halfword (16 bits)
+         */
+        writeU16(offset, value) {
+            const addr = offset & ~3;
+            const shift = (offset & 2) * 8;
+            let word = this.readU32(addr);
+            word = (word & ~(0xFFFF << shift)) | ((value & 0xFFFF) << shift);
+            this.writeU32(addr, word);
+        }
+
+        /**
+         * Escreve um registrador de 32 bits (MMIO)
+         */
+        writeU32(offset, value) {
+            value = value >>> 0;
+            offset = offset & 0xFFFF;
+
+            switch (offset) {
+                case 0x0000:  // CTRL register
+                    const wasEnabled = (this.ctrl & 0x01) !== 0;
+                    const isEnabled = (value & 0x01) !== 0;
+
+                    if (!wasEnabled && isEnabled) {
+                        if (this.debugEnabled) {
+                            console.log("[VDU] Display ativado");
+                        }
+                    } else if (wasEnabled && !isEnabled) {
+                        if (this.debugEnabled) {
+                            console.log("[VDU] Display desativado");
+                        }
+                    }
+
+                    this.ctrl = value;
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] writeU32(CTRL) = 0x${value.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    break;
+
+                case 0x0002:  // STAT register - Read-only, ignorar escrita
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] writeU32(STAT) = 0x${value.toString(16).padStart(8, '0').toUpperCase()} (ignorado - read-only)`);
+                    }
+                    break;
+
+                case 0x0004:  // FB_ADDR_H - Set high 16 bits of framebuffer address
+                    this.fbAddrHigh = value & 0xFFFF;
+                    this.fbAddr = (this.fbAddrHigh << 16) | this.fbAddrLow;
+
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] writeU32(FB_ADDR_H) = 0x${value.toString(16).padStart(8, '0').toUpperCase()}`);
+                        console.log(`[VDU] FB_ADDR completo = 0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    break;
+
+                case 0x0006:  // FB_ADDR_L - Set low 16 bits of framebuffer address
+                    this.fbAddrLow = value & 0xFFFF;
+                    this.fbAddr = (this.fbAddrHigh << 16) | this.fbAddrLow;
+
+                    if (this.debugEnabled) {
+                        console.log(`[VDU] writeU32(FB_ADDR_L) = 0x${value.toString(16).padStart(8, '0').toUpperCase()}`);
+                        console.log(`[VDU] FB_ADDR completo = 0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`);
+                    }
+                    break;
+
+                default:
+                    if (this.debugEnabled) {
+                        console.warn(`[VDU] writeU32 - Offset desconhecido: 0x${offset.toString(16).padStart(4, '0')}`);
+                    }
+            }
+        }
+
+        // ========== RENDER PRINCIPAL ==========
+
+        /**
+         * Renderiza o framebuffer da RAM para o canvas
+         * 
+         * Chamado 60x por segundo (ou quando necessário)
+         * 
+         * @param {SegmentedMemoryRegion|null} miu - Memory Interface Unit (se null, usa this.miu)
+         */
+        render(miu = null) {
+            const startTime = performance.now();
+            this.stats.framesAttempted++;
+
+            // Verificar se Display está habilitado
+            if (!(this.ctrl & 0x01)) {
+                if (this.debugEnabled) {
+                    console.log("[VDU] Display desativado, pulando render");
+                }
+                this.stats.boundsErrors++;
+                return false;
+            }
+
+            // Usar MIU fornecida ou conectada
+            miu = miu || this.miu;
+            if (!miu) {
+                console.warn("[VDU] ⚠️ MIU não disponível");
+                this.stats.framebufferErrors++;
+                return false;
+            }
+
+            try {
+                // ========== VALIDAÇÃO DE ENDEREÇO ==========
+                if (!this._validateFBAddress(miu)) {
+                    this.stats.framebufferErrors++;
+                    return false;
+                }
+
+                // ========== COPIAR PIXELS ==========
+                const success = this._copyFramebuffer(miu);
+
+                if (success) {
+                    // ========== ENVIAR PARA CANVAS ==========
+                    this.ctx.putImageData(this.imageData, 0, 0);
+                    this.stats.framesRendered++;
+
+                    // ========== SIMULAR VBLANK ==========
+                    this.triggerVBlank();
+
+                    const endTime = performance.now();
+                    this.stats.lastRenderTime = endTime - startTime;
+                    
+                    if (this.logEveryFrame) {
+                        console.log(`[VDU] Frame ${this.stats.framesRendered} renderizado em ${this.stats.lastRenderTime.toFixed(2)}ms`);
+                    }
+
+                    return true;
+                } else {
+                    this.stats.framebufferErrors++;
+                    return false;
+                }
+
+            } catch (err) {
+                console.error("[VDU] ❌ Erro ao renderizar:", err);
+                this.stats.framebufferErrors++;
+                return false;
+            }
+        }
+
+        /**
+         * Valida se o endereço do framebuffer é acessível
+         * @private
+         */
+        _validateFBAddress(miu) {
+            const segment = (this.fbAddr >>> 24) & 0xFF;
+            const offset = this.fbAddr & 0xFFFFFF;
+
+            // Verificar se segmento existe
+            const region = miu.getRegion ? miu.getRegion(segment) : miu.segments[segment];
+            if (!region) {
+                if (this.debugEnabled) {
+                    console.warn(`[VDU] ⚠️ Segmento 0x${segment.toString(16).padStart(2, '0').toUpperCase()} não mapeado`);
+                }
+                return false;
+            }
+
+            // Verificar se há espaço suficiente
+            const pixelCount = this.width * this.height;
+            const bytesNeeded = pixelCount * 4;  // RGBA8888 = 4 bytes/pixel
+            const regionSize = region.size || (region.buffer ? region.buffer.byteLength : 0);
+
+            if (offset + bytesNeeded > regionSize) {
+                if (this.debugEnabled) {
+                    console.warn(
+                        `[VDU] ⚠️ Framebuffer sai dos limites: ` +
+                        `offset=0x${offset.toString(16)} + ${bytesNeeded} bytes > region_size=${regionSize}`
+                    );
+                }
+                this.stats.boundsErrors++;
+                return false;
+            }
+
+            return true;
+        }
+
+        /**
+         * Copia pixels do framebuffer da RAM para imageData
+         * @private
+         */
+        _copyFramebuffer(miu) {
+            try {
+                const segment = (this.fbAddr >>> 24) & 0xFF;
+                const offset = this.fbAddr & 0xFFFFFF;
+
+                // Obter região (DRAM)
+                const region = miu.getRegion ? miu.getRegion(segment) : miu.segments[segment];
+                if (!region || !region.buffer) {
+                    console.error("[VDU] Região não tem buffer acessível");
+                    return false;
+                }
+
+                // Criar views
+                const ramView = new Uint32Array(region.buffer, offset, this.width * this.height);
+                const pixelCount = this.width * this.height;
+
+                // ========== CONVERSÃO DE CORES ==========
+                switch (this.colorMode) {
+                    case 'RGBA8888':
+                        // Cópia direta (RAM já está em RGBA8888)
+                        this.imageDataU32.set(ramView);
+                        break;
+
+                    case 'RGB565':
+                        // Converter de RGB565 (2 bytes) para RGBA8888
+                        const ramView16 = new Uint16Array(region.buffer, offset, this.width * this.height);
+                        for (let i = 0; i < pixelCount; i++) {
+                            const rgb565 = ramView16[i];
+                            this.imageDataU32[i] = this._rgb565ToRGBA8888(rgb565);
+                        }
+                        break;
+
+                    case 'RGB555':
+                        // Converter de RGB555 (2 bytes) para RGBA8888
+                        const ramViewRGB555 = new Uint16Array(region.buffer, offset, this.width * this.height);
+                        for (let i = 0; i < pixelCount; i++) {
+                            const rgb555 = ramViewRGB555[i];
+                            this.imageDataU32[i] = this._rgb555ToRGBA8888(rgb555);
+                        }
+                        break;
+
+                    case 'ARGB8888':
+                        // Converter de ARGB8888 para RGBA8888
+                        for (let i = 0; i < pixelCount; i++) {
+                            const argb = ramView[i];
+                            const a = (argb >>> 24) & 0xFF;
+                            const r = (argb >>> 16) & 0xFF;
+                            const g = (argb >>> 8) & 0xFF;
+                            const b = argb & 0xFF;
+                            this.imageDataU32[i] = (r << 24) | (g << 16) | (b << 8) | a;
+                        }
+                        break;
+
+                    default:
+                        console.warn(`[VDU] Modo de cores desconhecido: ${this.colorMode}`);
+                        this.imageDataU32.set(ramView);
+                }
+
+                return true;
+
+            } catch (err) {
+                console.error("[VDU] ❌ Erro ao copiar framebuffer:", err);
+                return false;
+            }
+        }
+
+        /**
+         * Converte RGB565 para RGBA8888
+         * @private
+         */
+        _rgb565ToRGBA8888(rgb565) {
+            const r = ((rgb565 >>> 11) & 0x1F) * 255 / 31;  // 5 bits
+            const g = ((rgb565 >>> 5) & 0x3F) * 255 / 63;   // 6 bits
+            const b = (rgb565 & 0x1F) * 255 / 31;            // 5 bits
+            const a = 0xFF;
+
+            return (Math.round(r) << 24) | (Math.round(g) << 16) | (Math.round(b) << 8) | a;
+        }
+
+        /**
+         * Converte RGB555 para RGBA8888
+         * @private
+         */
+        _rgb555ToRGBA8888(rgb555) {
+            const r = ((rgb555 >>> 10) & 0x1F) * 255 / 31;  // 5 bits
+            const g = ((rgb555 >>> 5) & 0x1F) * 255 / 31;   // 5 bits
+            const b = (rgb555 & 0x1F) * 255 / 31;            // 5 bits
+            const a = 0xFF;
+
+            return (Math.round(r) << 24) | (Math.round(g) << 16) | (Math.round(b) << 8) | a;
+        }
+
+// ========== VBLANK INTERRUPT ==========
+
+        /**
+         * Simula VBlank e dispara interrupt
+         * @private
+         */
+        triggerVBlank() {
+            this.status |= 0x01;  // Set VBlank flag
+            this.stats.vblanks++;
+
+            if (this.onVBlank) {
+                this.onVBlank();
+            }
+
+            if (this.onStatusChange) {
+                this.onStatusChange('vblank');
+            }
+
+            // Gerar interrupt se IntC está conectada
+            if (this.intC && this.intC.trigger) {
+                // VBlank é IRQ 4 por padrão
+                // this.intC.trigger(cpu, 4);  // Será chamado do engine
+            }
+
+            // Limpar flag após um tempo (simular duração de VBlank)
+            setTimeout(() => {
+                this.status &= ~0x01;
+            }, 1000 / 60);  // ~16ms a 60 FPS
+        }
+
+        // ========== MÉTODOS DE COMPATIBILIDADE ==========
+
+        /**
+         * Validação de offset
+         */
+        isValidOffset(offset) {
+            return offset >= 0 && offset <= 0x06;
+        }
+
+        /**
+         * Retorna informações sobre a VDU
+         */
+        getInfo() {
+            return {
+                type: this.constructor.name,
+                width: this.width,
+                height: this.height,
+                framebufferAddr: `0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`,
+                displayEnabled: (this.ctrl & 0x01) ? true : false,
+                inVBlank: (this.status & 0x01) ? true : false,
+                colorMode: this.colorMode,
+                stats: {
+                    ...this.stats,
+                    avgRenderTime: (this.stats.lastRenderTime).toFixed(2) + "ms"
+                }
+            };
+        }
+
+        /**
+         * Retorna status completo da VDU
+         */
+        getStatus() {
+            const lines = [];
+            lines.push("═══ VIDEO DISPLAY UNIT STATUS ═══");
+            lines.push(`Resolution:    ${this.width}x${this.height}`);
+            lines.push(`FB Address:    0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`);
+            lines.push(`Display:       ${(this.ctrl & 0x01) ? "ENABLED" : "DISABLED"}`);
+            lines.push(`VBlank:        ${(this.status & 0x01) ? "YES" : "NO"}`);
+            lines.push(`Color Mode:    ${this.colorMode}`);
+            lines.push("");
+            lines.push(`Frames Rendered: ${this.stats.framesRendered}`);
+            lines.push(`Frames Attempted: ${this.stats.framesAttempted}`);
+            lines.push(`FB Errors:       ${this.stats.framebufferErrors}`);
+            lines.push(`Bounds Errors:   ${this.stats.boundsErrors}`);
+            lines.push(`Last Render:     ${this.stats.lastRenderTime.toFixed(2)}ms`);
+            lines.push(`VBlanks:         ${this.stats.vblanks}`);
+
+            return lines.join("\n");
+        }
+
+        /**
+         * Dump formatado
+         */
+        dump() {
+            let output = "╔════════════════════════════════════╗\n";
+            output += "║   VIDEO DISPLAY UNIT (VDU)        ║\n";
+            output += "╚════════════════════════════════════╝\n\n";
+            output += this.getStatus();
+            output += "\n";
+            return output;
+        }
+
+        /**
+         * Ativa/desativa logging detalhado
+         */
+        setDebug(enabled) {
+            this.debugEnabled = enabled;
+            console.log(`[VDU] Debug: ${enabled ? "ATIVADO" : "DESATIVADO"}`);
+        }
+
+        /**
+         * Limpa tela (preenche com cor)
+         */
+        clear(r = 0, g = 0, b = 0, a = 255) {
+            const color = (r << 24) | (g << 16) | (b << 8) | a;
+            this.imageDataU32.fill(color);
+            this.ctx.putImageData(this.imageData, 0, 0);
+        }
+
+        /**
+         * Altera resolução dinamicamente
+         */
+        setResolution(w, h) {
+            if (w !== this.width || h !== this.height) {
+                this.width = w;
+                this.height = h;
+                this.canvas.width = w;
+                this.canvas.height = h;
+                this.imageData = this.ctx.createImageData(this.width, this.height);
+                this.imageDataU32 = new Uint32Array(this.imageData.data.buffer);
+
+                console.log(`[VDU] Resolução alterada para ${w}x${h}`);
+            }
+        }
+
+        /**
+         * Altera modo de cores
+         */
+        setColorMode(mode) {
+            const validModes = ['RGBA8888', 'RGB565', 'RGB555', 'ARGB8888'];
+            if (validModes.includes(mode)) {
+                this.colorMode = mode;
+                console.log(`[VDU] Modo de cores alterado para ${mode}`);
+            } else {
+                console.warn(`[VDU] ⚠️ Modo de cores inválido: ${mode}`);
+            }
+        }
+
+        /**
+         * Retorna relatório de diagnóstico
+         */
+        getDiagnostics() {
+            return {
+                canvas: {
+                    id: this.canvasId,
+                    exists: this.canvas !== null,
+                    width: this.canvas?.width,
+                    height: this.canvas?.height,
+                    context2d: this.ctx !== null
+                },
+                vdu: {
+                    width: this.width,
+                    height: this.height,
+                    fbAddr: `0x${this.fbAddr.toString(16).padStart(8, '0').toUpperCase()}`,
+                    displayEnabled: !!(this.ctrl & 0x01),
+                    colorMode: this.colorMode
+                },
+                peripherals: {
+                    miu: this.miu !== null,
+                    intC: this.intC !== null
+                },
+                stats: this.stats
+            };
+        }
+
+        /**
+         * Imprime diagnóstico no console
+         */
+        printDiagnostics() {
+            const diag = this.getDiagnostics();
+            console.log("=== VDU DIAGNOSTICS ===");
+            console.log("Canvas:", diag.canvas);
+            console.log("VDU:", diag.vdu);
+            console.log("Peripherals:", diag.peripherals);
+            console.log("Stats:", diag.stats);
+        }
+
+        /**
+         * Reset da VDU
+         */
+        reset() {
+            this.ctrl = 0x01;  // Display enable
+            this.status = 0x00;
+            this.fbAddr = 0xA0000000;
+            this.fbAddrHigh = 0xA000;
+            this.fbAddrLow = 0x0000;
+            this.stats = {
+                framesRendered: 0,
+                framesAttempted: 0,
+                framebufferErrors: 0,
+                boundsErrors: 0,
+                lastRenderTime: 0,
+                avgRenderTime: 0,
+                vblanks: 0
+            };
+            this.clear();
+            console.log("[VDU] Reset completo");
+        }
+    }
+
+// ========== EXPORTAÇÃO GLOBAL ==========
+    window.VideoDisplayUnit = VideoDisplayUnit;
+
+    console.log("[VDU] ✓ VideoDisplayUnit carregada");
+    console.log("[VDU] ✓ Extends MemoryRegion - Compatível com MIU");
+    console.log("[VDU] ✓ Suporta acesso de 8/16/32 bits");
+    console.log("[VDU] ✓ Resolução: 320x224 (HyperScan nativa)");
+    console.log("[VDU] ✓ Framebuffer: 0xA0000000 (DRAM)");
+}

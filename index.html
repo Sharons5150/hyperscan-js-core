@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HyperScan DEV – SPG290 Dashboard</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+    <header>
+        <div class="header-top">
+            <h1>HyperScan DEV – SPG290 [S+Core RISC]</h1>
+            <div id="cpu-freq-display">0.00 MHz</div>
+        </div>
+
+        <div class="carousel-container">
+            <button class="nav-arrow" onclick="scrollMenu(-1)">❮</button>
+            <div class="toolbar-carousel" id="toolbar-scroll">
+                <div class="tool-group">
+                    <label class="custom-file-upload">
+                        <input type="file" id="rom-upload" accept=".bin,.rom">
+                        <span>LOAD ROM</span>
+                    </label>
+                    <div class="divider"></div>
+                    <button id="btn-run">RUN</button>
+                    <button id="btn-step">STEP</button>
+                    <button id="btn-pause">PAUSE</button>
+                    <button id="btn-reset">RESET</button>
+                </div>
+                <div class="tool-group">
+                    <button id="btn-debug-toggle">DEBUG</button>
+                    <label class="switch-label">
+                        <input type="checkbox" id="trace-toggle"> Trace
+                    </label>
+                </div>
+                <div class="tool-group">
+                    <div id="status-led" class="status-indicator"></div>
+                    <span id="system-status-text">SYSTEM READY</span>
+                </div>
+            </div>
+            <button class="nav-arrow" onclick="scrollMenu(1)">❯</button>
+        </div>
+    </header>
+
+    <main id="vdu-stage">
+        <canvas id="display" class="vdu-screen" width="320" height="224"></canvas>
+    </main>
+
+    <section id="luna-terminal">
+        <div id="console-out"></div>
+        <div id="autocomplete-box"></div>
+        
+        <div class="input-wrapper">
+            <span class="prompt">luna@spg290 ›</span>
+            <input type="text" id="console-input" autofocus spellcheck="false" autocomplete="off" placeholder="Digite 'help' para comandos...">
+        </div>
+    </section>
+
+    <script src="hyperscan/memory/memoryregion.js"></script>
+    <script src="hyperscan/memory/arraymemoryregion.js"></script>
+    <script src="hyperscan/memory/emptymemoryregion.js"></script>
+    <script src="hyperscan/memory/segmentedmemoryregion.js"></script>
+    <script src="hyperscan/timer.js"></script>
+    <script src="hyperscan/interrupt.js"></script>
+    <script src="hyperscan/io/io.js"></script>
+    <script src="hyperscan/io/uart.js"></script>
+    <script src="hyperscan/io/vdu.js"></script>
+    <script src="hyperscan/disasm.js"></script>
+    <script src="hyperscan/cpu.js"></script>
+    <script src="main.js"></script>
+    <script src="hyperscan/debugger.js"></script>
+    <script src="hyperscan/integration.js"></script>
+    <script src="test-boot.js"></script>
+    <script src="LunaConsole.js"></script>
+
+    <script>
+        // Lógica do carrossel
+        const toolbar = document.getElementById('toolbar-scroll');
+        function scrollMenu(dir) { toolbar.scrollBy({ left: dir * 200, behavior: 'smooth' }); }
+    </script>
+</body>
+</html>
+
